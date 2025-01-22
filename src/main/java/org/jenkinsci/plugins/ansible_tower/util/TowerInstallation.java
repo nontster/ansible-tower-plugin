@@ -109,13 +109,9 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
     private static <C extends Credentials> List<C> getCredsList(Class<C> type, Run run) {
         List<C> credsList;
 
-        if (run != null) {
-            if (run != null && run.getParent() != null) {
-                credsList = CredentialsProvider.lookupCredentials(type,
-                        run.getParent(), null, new DomainRequirement());
-            } else {
-                credsList = CredentialsProvider.lookupCredentials(type);
-            }
+        if (run != null && run.getParent() != null) {
+            credsList = CredentialsProvider.lookupCredentials(type,
+                    run.getParent(), null, new DomainRequirement());
         } else {
             credsList = CredentialsProvider.lookupCredentials(type);
         }
