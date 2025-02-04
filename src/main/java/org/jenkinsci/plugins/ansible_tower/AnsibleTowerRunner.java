@@ -52,11 +52,11 @@ public class AnsibleTowerRunner {
             return false;
         }
 
-        if(towerCredentialsId != null && !towerCredentialsId.equals("")) {
+        if (towerCredentialsId != null && !towerCredentialsId.equals("")) {
             towerConfigToRunOn.setTowerCredentialsId(towerCredentialsId);
         }
 
-        if(run != null) {
+        if (run != null) {
             towerConfigToRunOn.setRun(run);
         }
 
@@ -64,8 +64,8 @@ public class AnsibleTowerRunner {
         this.myJob = new TowerJob(myTowerConnection);
         try {
             this.myJob.setTemplateType(templateType);
-        } catch(AnsibleTowerException e) {
-            logger.println("ERROR: "+ e);
+        } catch (AnsibleTowerException e) {
+            logger.println("ERROR: " + e);
             return false;
         }
 
@@ -145,7 +145,7 @@ public class AnsibleTowerRunner {
         }
 
         if (expandedSkipJobTags != null && expandedSkipJobTags.equalsIgnoreCase("")) {
-            if(!expandedSkipJobTags.startsWith(",")) {
+            if (!expandedSkipJobTags.startsWith(",")) {
                 expandedSkipJobTags = "," + expandedSkipJobTags;
             }
         }
@@ -183,8 +183,8 @@ public class AnsibleTowerRunner {
             logger.println("[WARNING]: Credential defined but prompt for credential on launch is not set in tower job");
         }
         if (expandedScmBranch != null) {
-            if(template.containsKey("ask_scm_branch_on_launch")) {
-                if(!template.getBoolean("ask_scm_branch_on_launch")) {
+            if (template.containsKey("ask_scm_branch_on_launch")) {
+                if (!template.getBoolean("ask_scm_branch_on_launch")) {
                     logger.println("[WARNING]: SCM Branch defined but pompt for SCM back on launch is not set in tower job");
                 }
             } else {
@@ -227,9 +227,11 @@ public class AnsibleTowerRunner {
 
         boolean jobCompleted = false;
         // Assume the old logging behaviour (truncated logs) but we we are doing full logging or var logging then swtich to true
-        if (importTowerLogs.matches("full") || importTowerLogs.matches("vars")) { myTowerConnection.setGetFullLogs(true); }
+        if (importTowerLogs.matches("full") || importTowerLogs.matches("vars")) {
+            myTowerConnection.setGetFullLogs(true);
+        }
         while (!jobCompleted) {
-            if(Thread.currentThread().isInterrupted()) {
+            if (Thread.currentThread().isInterrupted()) {
                 myTowerConnection.releaseToken();
                 return this.cancelJob(logger);
             }
@@ -243,7 +245,7 @@ public class AnsibleTowerRunner {
                 return false;
             }
 
-           try {
+            try {
                 jobCompleted = this.myJob.isComplete();
             } catch (AnsibleTowerException e) {
                 logger.println("ERROR: Failed to get job status from Tower: " + e.getMessage());
@@ -251,7 +253,7 @@ public class AnsibleTowerRunner {
                 return false;
             }
             if (!jobCompleted) {
-                if(Thread.currentThread().isInterrupted()) {
+                if (Thread.currentThread().isInterrupted()) {
                     myTowerConnection.releaseToken();
                     return this.cancelJob(logger);
                 } else {
@@ -278,8 +280,8 @@ public class AnsibleTowerRunner {
         boolean wasSuccessful;
         try {
             wasSuccessful = this.myJob.wasSuccessful();
-        } catch(AnsibleTowerException e) {
-            logger.println("ERROR: Failed to get job compltion status: "+ e.getMessage());
+        } catch (AnsibleTowerException e) {
+            logger.println("ERROR: Failed to get job compltion status: " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
         }
@@ -287,8 +289,8 @@ public class AnsibleTowerRunner {
         HashMap<String, String> jenkinsVariables;
         try {
             jenkinsVariables = this.myJob.getExports();
-        } catch(AnsibleTowerException e) {
-            logger.println("Failed to get exported variables: "+ e);
+        } catch (AnsibleTowerException e) {
+            logger.println("Failed to get exported variables: " + e);
             myTowerConnection.releaseToken();
             return false;
         }
@@ -300,14 +302,19 @@ public class AnsibleTowerRunner {
             towerResults.put(entrySet.getKey(), entrySet.getValue());
         }
         if (envVars.size() != 0) {
-            Plugin envInjectPlugin = null;
-            try {
-                envInjectPlugin = Objects.requireNonNull(Jenkins.getInstance()).getPlugin("envinject");
-            } catch(NullPointerException e) {
-                // We don't care if we get a NPE here
+            Plugin envInjectPlugin = Jenkins.getInstance() != null ? Jenkins.getInstance().getPlugin("envinject") : null;
+            if (envInjectPlugin != null) {
+                EnvInjectActionSetter envInjectActionSetter = new EnvInjectActionSetter(ws);
+                try {
+                    envInjectActionSetter.addEnvVarsToRun(run, envVars);
+                } catch (Exception e) {
+                    logger.println("Unable to inject environment variables: " + e.getMessage());
+                    myTowerConnection.releaseToken();
+                    return false;
+                }
             }
 
-            if(envInjectPlugin != null) {
+            if (envInjectPlugin != null) {
                 EnvInjectActionSetter envInjectActionSetter = new EnvInjectActionSetter(ws);
                 try {
                     envInjectActionSetter.addEnvVarsToRun(run, envVars);
@@ -319,7 +326,7 @@ public class AnsibleTowerRunner {
             }
         }
 
-        if(wasSuccessful) {
+        if (wasSuccessful) {
             logger.println("Tower completed the requested job");
         } else {
             logger.println("Tower failed to complete the requested job");
@@ -332,12 +339,14 @@ public class AnsibleTowerRunner {
     }
 
     public void getJobLogs(String importTowerLogs, PrintStream logger) throws AnsibleTowerException {
-        if (importTowerLogs.matches("false")) { return; }
+        if (importTowerLogs.matches("false")) {
+            return;
+        }
 
         // If we are anything but false we have to pull the logs
         for (String event : this.myJob.getLogs()) {
             // However, if we are doing this for vars only then we don't need to display the logs
-            if (! importTowerLogs.matches("vars")) {
+            if (!importTowerLogs.matches("vars")) {
                 logger.println(event);
             }
         }
@@ -348,8 +357,8 @@ public class AnsibleTowerRunner {
         try {
             this.myJob.cancelJob();
             logger.println("Job successfully canceled in Tower");
-        } catch(AnsibleTowerException ae) {
-            logger.println("Failed to cancel tower job: "+ ae);
+        } catch (AnsibleTowerException ae) {
+            logger.println("Failed to cancel tower job: " + ae);
         }
         return false;
     }
@@ -359,8 +368,8 @@ public class AnsibleTowerRunner {
         try {
             projectSync.cancelSync();
             logger.println("Project sync successfullt canceled in Tower");
-        } catch(AnsibleTowerException ae) {
-            logger.println("Failed to cancel tower project sync: "+ ae);
+        } catch (AnsibleTowerException ae) {
+            logger.println("Failed to cancel tower project sync: " + ae);
         }
         return false;
     }
@@ -370,7 +379,7 @@ public class AnsibleTowerRunner {
                                FilePath ws, Run<?, ?> run, Properties towerResults, boolean async) {
 
         if (verbose) {
-            logger.println("Beginning Ansible Tower Project Sync on " + towerServer +" for "+ projectName);
+            logger.println("Beginning Ansible Tower Project Sync on " + towerServer + " for " + projectName);
         }
 
         // Get our Tower connector
@@ -382,7 +391,7 @@ public class AnsibleTowerRunner {
         }
 
         // Apply credential override if provided
-        if(towerCredentialsId != null && !towerCredentialsId.equals("")) {
+        if (towerCredentialsId != null && !towerCredentialsId.equals("")) {
             towerConfigToRunOn.setTowerCredentialsId(towerCredentialsId);
         }
 
@@ -403,7 +412,7 @@ public class AnsibleTowerRunner {
         TowerProject myProject = null;
         try {
             myProject = new TowerProject(expandedProject, myTowerConnection);
-        } catch(AnsibleTowerException e) {
+        } catch (AnsibleTowerException e) {
             logger.println("ERROR: Unable to lookup project: " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
@@ -416,8 +425,8 @@ public class AnsibleTowerRunner {
                 myTowerConnection.releaseToken();
                 return false;
             }
-        } catch(AnsibleTowerException e) {
-            logger.println("ERROR: Failed to check if the project can be synced: "+ e.getMessage());
+        } catch (AnsibleTowerException e) {
+            logger.println("ERROR: Failed to check if the project can be synced: " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
         }
@@ -437,7 +446,7 @@ public class AnsibleTowerRunner {
         }
 
         String syncURL = projectSync.getURL();
-        logger.println("Project Sync URL: "+ syncURL);
+        logger.println("Project Sync URL: " + syncURL);
         towerResults.put("SYNC_ID", projectSync.getID());
         towerResults.put("SYNC_URL", syncURL);
 
@@ -451,7 +460,7 @@ public class AnsibleTowerRunner {
         // Otherwise we can monitor the project sync
         boolean syncCompleted = false;
         while (!syncCompleted) {
-            if(Thread.currentThread().isInterrupted()) {
+            if (Thread.currentThread().isInterrupted()) {
                 myTowerConnection.releaseToken();
                 return this.cancelProjectSync(logger, projectSync);
             }
@@ -476,7 +485,7 @@ public class AnsibleTowerRunner {
                 return false;
             }
             if (!syncCompleted) {
-                if(Thread.currentThread().isInterrupted()) {
+                if (Thread.currentThread().isInterrupted()) {
                     myTowerConnection.releaseToken();
                     return this.cancelProjectSync(logger, projectSync);
                 } else {
@@ -492,7 +501,7 @@ public class AnsibleTowerRunner {
         // One final log of events (if we want them)
         // Note, that a job can complete long before Tower has finished consuming the logs. This can cause incomplete
         //    logs within Jenkins.
-        if(importTowerLogs) {
+        if (importTowerLogs) {
             try {
                 for (String event : projectSync.getLogs()) {
                     logger.println(event);
@@ -507,8 +516,8 @@ public class AnsibleTowerRunner {
         boolean wasSuccessful;
         try {
             wasSuccessful = projectSync.wasSuccessful();
-        } catch(AnsibleTowerException e) {
-            logger.println("ERROR: Failed to get project sync compltion status: "+ e.getMessage());
+        } catch (AnsibleTowerException e) {
+            logger.println("ERROR: Failed to get project sync compltion status: " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
         }
@@ -516,7 +525,7 @@ public class AnsibleTowerRunner {
 
         // Project sync can not export jenkins variables so we don't need to check for them here
 
-        if(wasSuccessful) {
+        if (wasSuccessful) {
             logger.println("Tower completed the requested project sync");
         } else {
             logger.println("Tower failed to complete the requested project sync");
@@ -533,7 +542,7 @@ public class AnsibleTowerRunner {
                                    EnvVars envVars, FilePath ws, Run<?, ?> run, Properties towerResults) {
 
         if (verbose) {
-            logger.println("Beginning Ansible Tower Project Revision on " + towerServer +" for "+ projectName);
+            logger.println("Beginning Ansible Tower Project Revision on " + towerServer + " for " + projectName);
         }
 
         // Get our Tower connector
@@ -545,7 +554,7 @@ public class AnsibleTowerRunner {
         }
 
         // Apply credential override if provided
-        if(towerCredentialsId != null && !towerCredentialsId.equals("")) {
+        if (towerCredentialsId != null && !towerCredentialsId.equals("")) {
             towerConfigToRunOn.setTowerCredentialsId(towerCredentialsId);
         }
 
@@ -568,7 +577,7 @@ public class AnsibleTowerRunner {
         TowerProject myProject = null;
         try {
             myProject = new TowerProject(expandedProject, myTowerConnection);
-        } catch(AnsibleTowerException e) {
+        } catch (AnsibleTowerException e) {
             logger.println("ERROR: Unable to lookup project: " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
@@ -581,8 +590,8 @@ public class AnsibleTowerRunner {
         // Update project revision
         try {
             return myProject.updateRevision(expandedRevision);
-        } catch(AnsibleTowerException e) {
-            logger.println("ERROR: Unable to update project revision "+ e.getMessage());
+        } catch (AnsibleTowerException e) {
+            logger.println("ERROR: Unable to update project revision " + e.getMessage());
             myTowerConnection.releaseToken();
             return false;
         }
