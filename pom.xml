@@ -10,7 +10,7 @@
 
     <groupId>org.jenkins-ci.plugins</groupId>
     <artifactId>ansible-tower</artifactId>
-    <version>0.17.0</version>
+    <version>0.17.1-SNAPSHOT</version>
     <packaging>hpi</packaging>
     <name>Ansible Tower Plugin</name>
     <description>
