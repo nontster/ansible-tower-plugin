@@ -1,46 +1,48 @@
 package org.jenkinsci.plugins.ansible_tower.util;
 
-/*
-    This class handles all of the connections (api calls) to Tower itself
- */
-
 import com.google.common.net.HttpHeaders;
 import net.sf.json.JSONArray;
-import org.apache.http.Header;
-import org.apache.http.client.methods.*;
-import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerDoesNotSupportAuthToken;
-import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerRefusesToGiveToken;
-import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerException;
-
-import java.io.*;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URLEncoder;
-import java.nio.charset.Charset;
-import java.security.KeyStore;
-import java.util.*;
-
 import net.sf.json.JSONObject;
 import org.apache.commons.codec.binary.Base64;
-
+import org.apache.http.Header;
 import org.apache.http.HttpResponse;
-import org.apache.http.HttpVersion;
-import org.apache.http.conn.ClientConnectionManager;
-import org.apache.http.conn.scheme.Scheme;
-import org.apache.http.conn.scheme.SchemeRegistry;
-import org.apache.http.conn.ssl.SSLSocketFactory;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.HttpDelete;
+import org.apache.http.client.methods.HttpEntityEnclosingRequestBase;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
+import org.apache.http.client.methods.HttpPatch;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.config.Registry;
+import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.socket.ConnectionSocketFactory;
+import org.apache.http.conn.socket.PlainConnectionSocketFactory;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.DefaultHttpClient;
-
-import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
-import org.apache.http.params.BasicHttpParams;
-import org.apache.http.params.HttpParams;
-import org.apache.http.params.HttpProtocolParams;
-import org.apache.http.protocol.HTTP;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.ssl.SSLContexts;
+import org.apache.http.ssl.TrustStrategy;
 import org.apache.http.util.EntityUtils;
+import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerDoesNotSupportAuthToken;
+import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerException;
 import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerItemDoesNotExist;
+import org.jenkinsci.plugins.ansible_tower.exceptions.AnsibleTowerRefusesToGiveToken;
+
+import javax.net.ssl.SSLContext;
+import java.io.IOException;
+import java.io.Serializable;
+import java.io.UnsupportedEncodingException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Vector;
 
 public class TowerConnector implements Serializable {
+    private static final long serialVersionUID = 1L;
     // If adding a new method, make sure to update getMethodName()
     public static final int GET = 1;
     public static final int POST = 2;
@@ -48,33 +50,37 @@ public class TowerConnector implements Serializable {
     public static final String JOB_TEMPLATE_TYPE = "job";
     public static final String WORKFLOW_TEMPLATE_TYPE = "workflow";
     private static final String ARTIFACTS = "artifacts";
-    private static String API_VERSION = "v2";
+    private static final String API_VERSION = "v2";
 
     private String authorizationHeader = null;
     private String oauthToken = null;
     private String oAuthTokenID = null;
-    private String url = null;
-    private String username = null;
-    private String password = null;
+    private final String url;
+    private final String username;
+    private final String password;
     private TowerVersion towerVersion = null;
-    private boolean trustAllCerts = true;
+    private final boolean trustAllCerts;
     private boolean importChildWorkflowLogs = false;
-    private TowerLogger logger = new TowerLogger();
-    private HashMap<Long, Long> logIdForWorkflows = new HashMap<Long, Long>();
-    private HashMap<Long, Long> logIdForJobs = new HashMap<Long, Long>();
+    private final TowerLogger logger = new TowerLogger();
+    private final HashMap<Long, Long> logIdForWorkflows = new HashMap<>();
+    private final HashMap<Long, Long> logIdForJobs = new HashMap<>();
 
     private boolean removeColor = true;
     private boolean getFullLogs = false;
-    private HashMap<String, String> jenkinsExports = new HashMap<String, String>();
+    private final HashMap<String, String> jenkinsExports = new HashMap<>();
+
+    private transient CloseableHttpClient httpClient;
+    private transient PoolingHttpClientConnectionManager connectionManager;
+
 
     public TowerConnector(String url, String username, String password) { this(url, username, password, null, false, false); }
 
     public TowerConnector(String url, String username, String password, String oauthToken, Boolean trustAllCerts, Boolean debug) {
-        // Credit to https://stackoverflow.com/questions/7438612/how-to-remove-the-last-character-from-a-string
-        if(url != null && url.length() > 0 && url.charAt(url.length() - 1) == '/') {
-            url = url.substring(0, (url.length() - 1));
+        if(url != null && !url.isEmpty() && url.charAt(url.length() - 1) == '/') {
+            this.url = url.substring(0, (url.length() - 1));
+        } else {
+            this.url = url;
         }
-        this.url = url;
         this.username = username;
         this.password = password;
         this.oauthToken = oauthToken;
@@ -82,16 +88,15 @@ public class TowerConnector implements Serializable {
         this.setDebug(debug);
         try {
             this.getVersion();
-            logger.logMessage("Connecting to Tower version: "+ this.towerVersion.getVersion());
+            if(this.towerVersion != null) {
+                logger.logMessage("Connecting to Tower version: " + this.towerVersion.getVersion());
+            }
         } catch(AnsibleTowerException ate) {
-            logger.logMessage("Failed to get connection to get version; auth errors may ensue "+ ate);
+            logger.logMessage("Failed to get Tower version; auth errors may ensue: "+ ate.getMessage());
         }
-        logger.logMessage("Created a connector with "+ username +"@"+ url);
+        logger.logMessage("Created a connector with "+ username +"@"+ this.url);
     }
 
-    public void setTrustAllCerts(boolean trustAllCerts) {
-        this.trustAllCerts = trustAllCerts;
-    }
     public void setDebug(boolean debug) {
         logger.setDebugging(debug);
     }
@@ -100,40 +105,52 @@ public class TowerConnector implements Serializable {
     public void setGetFullLogs(boolean getFullLogs) { this.getFullLogs = getFullLogs; }
     public HashMap<String, String> getJenkinsExports() { return jenkinsExports; }
 
-    private DefaultHttpClient getHttpClient() throws AnsibleTowerException {
-        URI myURI = null;
-        try {
-            myURI = new URI(url);
-        } catch(URISyntaxException urise) {
-            throw new AnsibleTowerException("Unable to prase base url: "+ urise);
-        }
-
-        if(trustAllCerts && myURI.getScheme().equalsIgnoreCase("https")) {
-            logger.logMessage("Forcing cert trust");
-            TrustingSSLSocketFactory sf;
+    private CloseableHttpClient getHttpClient() throws AnsibleTowerException {
+        if (this.httpClient == null) {
             try {
-                KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
-                trustStore.load(null, null);
-                sf = new TrustingSSLSocketFactory(trustStore);
-            } catch(Exception e) {
-                throw new AnsibleTowerException("Unable to create trusting SSL socket factory");
+                RequestConfig requestConfig = RequestConfig.custom()
+                        .setConnectTimeout(10 * 1000)
+                        .setSocketTimeout(30 * 1000)
+                        .setConnectionRequestTimeout(10 * 1000)
+                        .build();
+
+                HttpClientBuilder clientBuilder = HttpClientBuilder.create()
+                        .setDefaultRequestConfig(requestConfig);
+
+                Registry<ConnectionSocketFactory> socketFactoryRegistry;
+                if (this.trustAllCerts) {
+                    logger.logMessage("Forcing cert trust");
+                    TrustStrategy acceptingTrustStrategy = (chain, authType) -> true;
+                    SSLContext sslContext = SSLContexts.custom().loadTrustMaterial(null, acceptingTrustStrategy).build();
+                    SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(sslContext, SSLConnectionSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER);
+                    socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
+                            .register("http", PlainConnectionSocketFactory.getSocketFactory())
+                            .register("https", sslsf)
+                            .build();
+                } else {
+                    socketFactoryRegistry = RegistryBuilder.<ConnectionSocketFactory>create()
+                            .register("http", PlainConnectionSocketFactory.getSocketFactory())
+                            .register("https", SSLConnectionSocketFactory.getSystemSocketFactory())
+                            .build();
+                }
+
+                this.connectionManager = new PoolingHttpClientConnectionManager(socketFactoryRegistry);
+                this.connectionManager.setMaxTotal(100);
+                this.connectionManager.setDefaultMaxPerRoute(20);
+                this.connectionManager.setValidateAfterInactivity(5000);
+
+                clientBuilder.setConnectionManager(this.connectionManager);
+                clientBuilder.setKeepAliveStrategy((response, context) -> 60 * 1000);
+
+                this.httpClient = clientBuilder.build();
+
+            } catch (Exception e) {
+                throw new AnsibleTowerException("Failed to create HttpClient: " + e.getMessage(), e);
             }
-            sf.setHostnameVerifier(SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER);
-
-            HttpParams params = new BasicHttpParams();
-            HttpProtocolParams.setVersion(params, HttpVersion.HTTP_1_1);
-            HttpProtocolParams.setContentCharset(params, HTTP.UTF_8);
-
-            SchemeRegistry registry = new SchemeRegistry();
-            registry.register(new Scheme("https", sf, 443));
-
-            ClientConnectionManager ccm = new ThreadSafeClientConnManager(params, registry);
-
-            return new DefaultHttpClient(ccm, params);
-        } else {
-            return new DefaultHttpClient();
         }
+        return this.httpClient;
     }
+
 
     private String buildEndpoint(String endpoint) {
         if(endpoint.startsWith("/api/")) { return endpoint; }
@@ -148,17 +165,16 @@ public class TowerConnector implements Serializable {
         return makeRequest(requestType, endpoint, null, false);
     }
 
-    private HttpResponse makeRequest(int requestType, String endpoint, JSONObject body) throws AnsibleTowerException, AnsibleTowerItemDoesNotExist {
+    private HttpResponse makeRequest(int requestType, String endpoint, JSONObject body) throws AnsibleTowerException {
         return makeRequest(requestType, endpoint, body, false);
     }
 
-    public HttpResponse makeRequest(int requestType, String endpoint, JSONObject body, boolean noAuth) throws AnsibleTowerException, AnsibleTowerItemDoesNotExist {
-        // Parse the URL
+    public HttpResponse makeRequest(int requestType, String endpoint, JSONObject body, boolean noAuth) throws AnsibleTowerException {
         URI myURI;
         try {
-            myURI = new URI(url+buildEndpoint(endpoint));
+            myURI = new URI(url + buildEndpoint(endpoint));
         } catch(Exception e) {
-            throw new AnsibleTowerException("URL issue: "+ e.getMessage());
+            throw new AnsibleTowerException("URL issue: "+ e.getMessage(), e);
         }
 
         logger.logMessage("Building "+ getMethodName(requestType) +" request to "+ myURI.toString());
@@ -175,10 +191,10 @@ public class TowerConnector implements Serializable {
             }
             if (body != null && !body.isEmpty()) {
                 try {
-                    StringEntity bodyEntity = new StringEntity(body.toString());
+                    StringEntity bodyEntity = new StringEntity(body.toString(), StandardCharsets.UTF_8);
                     myRequest.setEntity(bodyEntity);
-                } catch (UnsupportedEncodingException uee) {
-                    throw new AnsibleTowerException("Unable to encode body as JSON: " + uee.getMessage());
+                } catch (Exception uee) {
+                    throw new AnsibleTowerException("Unable to encode body as JSON: " + uee.getMessage(), uee);
                 }
             }
             request = myRequest;
@@ -187,252 +203,181 @@ public class TowerConnector implements Serializable {
             throw new AnsibleTowerException("The requested method is unknown");
         }
 
-        // If we haven't determined auth yet we need to go get it
         if(!noAuth) {
             if(this.authorizationHeader == null) {
-                // We dont' have an authorization header yet so we need to construct one
                 logger.logMessage("Determining authorization headers");
-
                 if(this.oauthToken != null) {
-                    // First if we have an oauthToken we can just use it
                     logger.logMessage("Adding oauth bearer token from Jenkins");
                     this.authorizationHeader = "Bearer "+ this.oauthToken;
                 } else if(this.username != null && this.password != null) {
-                    // Second, if we have a username and a password we can try to go get a token
-
-                    // For trying to get a token, we will first attempt to self create an oAuthToken if Tower supports it
                     if (this.towerSupports("/api/o/")) {
                         logger.logMessage("Getting an oAuth token for "+ this.username);
                         try {
                             this.authorizationHeader = "Bearer " + this.getOAuthToken();
                         } catch(AnsibleTowerException ate) {
-                            logger.logMessage("Unable to get oAuth Toekn: "+ ate.getMessage());
+                            logger.logMessage("Unable to get oAuth Token: "+ ate.getMessage());
                         }
                     }
-
-                    // Second, we will try to get a legacy authtoken if Tower supports if
                     if(this.authorizationHeader == null && this.towerSupports("/api/v2/authtoken")) {
                         logger.logMessage("Getting a legacy token for " + this.username);
                         try {
                             this.authorizationHeader = "Token " + this.getAuthToken();
                         } catch (AnsibleTowerException ate) {
-                            logger.logMessage("Unable to get legacuy token: " + ate.getMessage());
+                            logger.logMessage("Unable to get legacy token: " + ate.getMessage());
                         }
                     }
-
-                    // Finally, we will revert to basic auth.
-                    // There could be a case where someone allows basic auth to the API and
-                    // Refuses oAuth token creation for LDAO based users.
-                    // This would allow for that conditio
-                    /* To test this scenario I created an AWX devel install and added this line:
-                        ----------------------------------------------------------------
-                        diff --git a/awx/main/models/oauth.py b/awx/main/models/oauth.py
-                        index 51bb9be0e..b2b9d80aa 100644
-                                --- a/awx/main/models/oauth.py
-                                +++ b/awx/main/models/oauth.py
-                        @@ -135,6 +135,7 @@ class OAuth2AccessToken(AbstractAccessToken):
-                        return valid
-
-                        def validate_external_users(self):
-                        +        raise oauth2.AccessDeniedError('OAuth2 Tokens cannot be created')
-                        if self.user and settings.ALLOW_OAUTH2_FOR_EXTERNAL_USERS is False:
-                        external_account = get_external_account(self.user)
-                        if external_account is not None:
-                        ----------------------------------------------------------------
-                        This made it impossible for any user to get an oAuth toekn
-                        simulating what would happen to a user if they were an LDAP source and the option to
-                        disable tokens for LDAP users were turned on.
-                    */
-
                     if (this.authorizationHeader == null) {
-                        logger.logMessage("Tower does not support authtoken or oauth, reverting to basic auth");
+                        logger.logMessage("Reverting to basic auth");
                         this.authorizationHeader = this.getBasicAuthString();
                     }
                 } else {
                     throw new AnsibleTowerException("Auth is required for this call but no auth info exists");
                 }
-
             }
-
             if(this.authorizationHeader == null) {
-                throw new AnsibleTowerException("We should have gotten an authorization header but did not");
+                throw new AnsibleTowerException("Failed to obtain an authorization header");
             }
             request.setHeader(HttpHeaders.AUTHORIZATION, this.authorizationHeader);
         }
 
-        // Dump the request
-        // logger.logMessage(this.dumpRequest(request));
-
-        DefaultHttpClient httpClient = getHttpClient();
+        CloseableHttpClient client = getHttpClient();
         HttpResponse response;
         try {
-            response = httpClient.execute(request);
+            response = client.execute(request);
         } catch(Exception e) {
-            throw new AnsibleTowerException("Unable to make tower request: "+ e.getMessage());
+            throw new AnsibleTowerException("Unable to make tower request: "+ e.getMessage(), e);
         }
 
         logger.logMessage("Request completed with ("+ response.getStatusLine().getStatusCode() +")");
-        if(response.getStatusLine().getStatusCode() == 404) {
-            throw new AnsibleTowerItemDoesNotExist("The item does not exist");
-        } else if(response.getStatusLine().getStatusCode() == 401) {
-            throw new AnsibleTowerException("Username/password invalid");
-        } else if(response.getStatusLine().getStatusCode() == 403) {
-            String exceptionText = "Request was forbidden";
-            JSONObject responseObject = null;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                logger.logMessage(json);
-                responseObject = JSONObject.fromObject(json);
-                if(responseObject.containsKey("detail")) {
-                    exceptionText+= ": "+ responseObject.getString("detail");
-                }
-            } catch (IOException ioe) {
-                // Ignore if we get an error
-            }
+        int statusCode = response.getStatusLine().getStatusCode();
 
+        if(statusCode == 404) {
+            EntityUtils.consumeQuietly(response.getEntity());
+            throw new AnsibleTowerItemDoesNotExist("The item does not exist");
+        } else if(statusCode == 401) {
+            EntityUtils.consumeQuietly(response.getEntity());
+            throw new AnsibleTowerException("Username/password invalid");
+        } else if(statusCode == 403) {
+            String exceptionText = "Request was forbidden";
+            try {
+                String json = EntityUtils.toString(response.getEntity());
+                logger.logMessage(json);
+                JSONObject responseObject = JSONObject.fromObject(json);
+                if(responseObject.containsKey("detail")) {
+                    exceptionText += ": "+ responseObject.getString("detail");
+                }
+            } catch (Exception e) {
+                logger.logMessage("Unable to parse 403 response body: " + e.getMessage());
+            } finally {
+                EntityUtils.consumeQuietly(response.getEntity());
+            }
             throw new AnsibleTowerException(exceptionText);
         }
-
         return response;
     }
 
-
-    private String dumpRequest(HttpUriRequest theRequest) {
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("Request Method = [" + theRequest.getMethod() + "], ");
-        sb.append("Request URL Path = [" + theRequest.getURI()+ "], ");
-
-        sb.append("[headers]");
-        for(Header aHeader : theRequest.getAllHeaders()) {
-            sb.append("    "+ aHeader.getName() +": "+ aHeader.getValue());
-        }
-
-        return sb.toString();
-    }
-
-
     private boolean towerSupports(String end_point) throws AnsibleTowerException {
-        // To determine if we support oAuth we will be making a HEAD call to /api/o to see what happens
-
         URI myURI;
         try {
-            myURI = new URI(url+end_point);
+            myURI = new URI(url + end_point);
         } catch(Exception e) {
-            throw new AnsibleTowerException("Unable to construct URL for "+ end_point +": "+ e.getMessage());
+            throw new AnsibleTowerException("Unable to construct URL for "+ end_point +": "+ e.getMessage(), e);
         }
-
-        logger.logMessage("Checking if Tower can: "+ myURI.toString());
-
-        DefaultHttpClient httpClient = getHttpClient();
-        HttpResponse response;
+        logger.logMessage("Checking if Tower supports: "+ myURI.toString());
+        HttpHead request = new HttpHead(myURI);
         try {
-            response = httpClient.execute(new HttpHead(myURI));
+            HttpResponse response = getHttpClient().execute(request);
+            EntityUtils.consumeQuietly(response.getEntity());
+            int statusCode = response.getStatusLine().getStatusCode();
+            logger.logMessage("Support check request completed with ("+ statusCode +")");
+            return statusCode != 404;
         } catch(Exception e) {
-            throw new AnsibleTowerException("Unable to make Tower HEAD request for "+ end_point +": "+ e.getMessage());
-        }
-
-        logger.logMessage("Can Tower request completed with ("+ response.getStatusLine().getStatusCode() +")");
-        if(response.getStatusLine().getStatusCode() == 404) {
-            logger.logMessage("Tower does not supoort "+ end_point);
-            return false;
-        } else {
-            logger.logMessage("Tower supoorts "+ end_point);
-            return true;
+            throw new AnsibleTowerException("Unable to make Tower HEAD request for "+ end_point +": "+ e.getMessage(), e);
         }
     }
 
     public String getURL() { return url; }
+
     public void getVersion() throws AnsibleTowerException {
-        // The version is housed on the poing page which is openly accessable
         HttpResponse response = makeRequest(GET, "ping/", null, true);
-        if(response.getStatusLine().getStatusCode() != 200) {
-            throw new AnsibleTowerException("Unexpected error code returned from ping connection ("+ response.getStatusLine().getStatusCode() +")");
-        }
-        logger.logMessage("Ping page loaded");
-
-        JSONObject responseObject;
-        String json;
         try {
-            json = EntityUtils.toString(response.getEntity());
-            responseObject = JSONObject.fromObject(json);
-        } catch (IOException ioe) {
-            throw new AnsibleTowerException("Unable to read ping response and convert it into json: " + ioe.getMessage());
-        }
-
-        if (responseObject.containsKey("version")) {
-            logger.logMessage("Successfully got version "+ responseObject.getString("version"));
-            this.towerVersion = new TowerVersion(responseObject.getString("version"));
+            if(response.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Unexpected error code from ping ("+ response.getStatusLine().getStatusCode() +")");
+            }
+            logger.logMessage("Ping page loaded");
+            String json = EntityUtils.toString(response.getEntity());
+            JSONObject responseObject = JSONObject.fromObject(json);
+            if (responseObject.containsKey("version")) {
+                logger.logMessage("Successfully got version "+ responseObject.getString("version"));
+                this.towerVersion = new TowerVersion(responseObject.getString("version"));
+            }
+        } catch (IOException e) {
+            throw new AnsibleTowerException("Unable to read ping response: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
     }
 
     public void testConnection() throws AnsibleTowerException {
         if(url == null) { throw new AnsibleTowerException("The URL is undefined"); }
-
-        // We will run an unauthenticated test by the constructor calling the ping page so we can jump
-        // straight into calling an authentication test
-
-        // This will run an authentication test
         logger.logMessage("Testing authentication");
         HttpResponse response = makeRequest(GET, "jobs/");
-        if(response.getStatusLine().getStatusCode() != 200) {
-            throw new AnsibleTowerException("Failed to get authenticated connection ("+ response.getStatusLine().getStatusCode() +")");
+        try {
+            if(response.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Failed to get authenticated connection ("+ response.getStatusLine().getStatusCode() +")");
+            }
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
         releaseToken();
     }
 
-    public String convertPotentialStringToID(String idToCheck, String api_endpoint) throws AnsibleTowerException, AnsibleTowerItemDoesNotExist {
+    public String convertPotentialStringToID(String idToCheck, String api_endpoint) throws AnsibleTowerException {
         JSONObject foundItem = rawLookupByString(idToCheck, api_endpoint);
         logger.logMessage("Response from lookup: "+ foundItem.getString("id"));
         return foundItem.getString("id");
     }
 
-    public JSONObject rawLookupByString(String idToCheck, String api_endpoint) throws AnsibleTowerException, AnsibleTowerItemDoesNotExist {
+    public JSONObject rawLookupByString(String idToCheck, String api_endpoint) throws AnsibleTowerException {
         try {
             Integer.parseInt(idToCheck);
-            // We got an ID so lets see if we can load that item
             HttpResponse response = makeRequest(GET, api_endpoint + idToCheck +"/");
-            JSONObject responseObject;
             try {
-                responseObject = JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
+                String json = EntityUtils.toString(response.getEntity());
+                JSONObject responseObject = JSONObject.fromObject(json);
                 if(!responseObject.containsKey("id")) {
                     throw new AnsibleTowerItemDoesNotExist("Did not get an ID back from the request");
                 }
+                return responseObject;
             } catch (IOException ioe) {
-                throw new AnsibleTowerException(ioe.getMessage());
+                throw new AnsibleTowerException(ioe.getMessage(), ioe);
+            } finally {
+                EntityUtils.consumeQuietly(response.getEntity());
             }
-            return responseObject;
         } catch(NumberFormatException nfe) {
-
-            HttpResponse response = null;
+            HttpResponse response;
             try {
-                // We were probably given a name, lets try and resolve the name to an ID
                 response = makeRequest(GET, api_endpoint + "?name=" + URLEncoder.encode(idToCheck, "UTF-8"));
             } catch(UnsupportedEncodingException e) {
-                throw new AnsibleTowerException("Unable to encode item name for lookup");
+                throw new AnsibleTowerException("Unable to encode item name for lookup", e);
             }
 
-            JSONObject responseObject;
             try {
-                responseObject = JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
+                JSONObject responseObject = JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
+                if(!responseObject.containsKey("results")) {
+                    throw new AnsibleTowerException("Response for items does not contain results");
+                }
+                if(responseObject.getInt("count") == 0) {
+                    throw new AnsibleTowerItemDoesNotExist("Unable to get any results when looking up "+ idToCheck);
+                } else if(responseObject.getInt("count") > 1) {
+                    throw new AnsibleTowerException("The item "+ idToCheck +" is not unique");
+                } else {
+                    return (JSONObject) responseObject.getJSONArray("results").get(0);
+                }
             } catch (IOException ioe) {
-                throw new AnsibleTowerException("Unable to convert response for all items into json: " + ioe.getMessage());
-            }
-            // If we didn't get results, fail
-            if(!responseObject.containsKey("results")) {
-                throw new AnsibleTowerException("Response for items does not contain results");
-            }
-
-            // Loop over the results, if one of the items has the name copy its ID
-            // If there are more than one job with the same name, fail
-            if(responseObject.getInt("count") == 0) {
-                throw new AnsibleTowerException("Unable to get any results when looking up "+ idToCheck);
-            } else if(responseObject.getInt("count") > 1) {
-                throw new AnsibleTowerException("The item "+ idToCheck +" is not unique");
-            } else {
-                JSONObject foundItem = (JSONObject) responseObject.getJSONArray("results").get(0);
-                return foundItem;
+                throw new AnsibleTowerException("Unable to convert response for all items into json: " + ioe.getMessage(), ioe);
+            } finally {
+                EntityUtils.consumeQuietly(response.getEntity());
             }
         }
     }
@@ -443,60 +388,54 @@ public class TowerConnector implements Serializable {
         }
 
         checkTemplateType(templateType);
-        String apiEndPoint = "/job_templates/";
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) {
-            apiEndPoint = "/workflow_job_templates/";
-        }
+        String apiEndPoint = templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE) ? "/workflow_job_templates/" : "/job_templates/";
 
+        String templateId;
         try {
-            jobTemplate = convertPotentialStringToID(jobTemplate, apiEndPoint);
+            templateId = convertPotentialStringToID(jobTemplate, apiEndPoint);
         } catch(AnsibleTowerItemDoesNotExist atidne) {
-            String ucTemplateType = templateType.replaceFirst(templateType.substring(0,1), templateType.substring(0,1).toUpperCase());
-            throw new AnsibleTowerException(ucTemplateType +" template does not exist in tower");
+            String ucTemplateType = templateType.substring(0, 1).toUpperCase() + templateType.substring(1);
+            throw new AnsibleTowerException(ucTemplateType +" template '"+ jobTemplate +"' does not exist in tower", atidne);
         } catch(AnsibleTowerException ate) {
-            throw new AnsibleTowerException("Unable to find "+ templateType +" template: "+ ate.getMessage());
+            throw new AnsibleTowerException("Unable to find "+ templateType +" template '"+ jobTemplate +"': "+ ate.getMessage(), ate);
         }
 
-        // Now get the job template so we can check the options being passed in
-        HttpResponse response = makeRequest(GET, apiEndPoint + jobTemplate + "/");
-        if (response.getStatusLine().getStatusCode() != 200) {
-            throw new AnsibleTowerException("Unexpected error code returned when getting template (" + response.getStatusLine().getStatusCode() + ")");
-        }
-        String json;
+        HttpResponse response = makeRequest(GET, apiEndPoint + templateId + "/");
         try {
-            json = EntityUtils.toString(response.getEntity());
-            return JSONObject.fromObject(json);
-        } catch (IOException ioe) {
-            throw new AnsibleTowerException("Unable to read template response and convert it into json: " + ioe.getMessage());
+            if (response.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Unexpected error code returned when getting template (" + response.getStatusLine().getStatusCode() + ")");
+            }
+            return JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
+        } catch (IOException e) {
+            throw new AnsibleTowerException("Unable to read template response and convert it into json: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
     }
 
-
     private void processCredentials(String credential, JSONObject postBody) throws AnsibleTowerException {
-        // Get the machine or vault credential types
         HttpResponse response = makeRequest(GET,"/credential_types/?or__kind=ssh&or__kind=vault");
-        if(response.getStatusLine().getStatusCode() != 200) {
-            throw new AnsibleTowerException("Unable to lookup the credential types");
-        }
         JSONObject responseObject;
-        String json;
         try {
-            json = EntityUtils.toString(response.getEntity());
-            responseObject = JSONObject.fromObject(json);
+            if(response.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Unable to lookup the credential types ("+ response.getStatusLine().getStatusCode() +")");
+            }
+            responseObject = JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
         } catch(IOException ioe) {
-            throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
+            throw new AnsibleTowerException("Unable to read credential types response and convert it into json: "+ ioe.getMessage(), ioe);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
 
-        if(responseObject.getInt("count") != 2) {
-            throw new AnsibleTowerException("Unable to find both machine and vault credentials type");
+        if(responseObject.getInt("count") < 2) {
+            logger.logMessage("[WARNING]: Unable to find both machine and vault credential types. This may be normal for older Tower versions.");
         }
 
         long machine_credential_type = -1L;
         long vault_credential_type = -1L;
         JSONArray credentialTypesArray = responseObject.getJSONArray("results");
-        Iterator<JSONObject> listIterator = credentialTypesArray.iterator();
-        while(listIterator.hasNext()) {
-            JSONObject aCredentialType = listIterator.next();
+        for(Object credTypeObj : credentialTypesArray) {
+            JSONObject aCredentialType = (JSONObject) credTypeObj;
             if(aCredentialType.getString("kind").equalsIgnoreCase("ssh")) {
                 machine_credential_type = aCredentialType.getLong("id");
             } else if(aCredentialType.getString("kind").equalsIgnoreCase("vault")) {
@@ -504,30 +443,14 @@ public class TowerConnector implements Serializable {
             }
         }
 
-        if (vault_credential_type == -1L) {
-            logger.logMessage("[ERROR]: Unable to find vault credential type");
-        }
-        if (machine_credential_type == -1L) {
-            logger.logMessage("[ERROR]: Unable to find machine credential type");
-        }
-        /*
-            Credential can be a comma delineated list and in 2.3.x can come in three types:
-                Machine credentials
-                Vaiult credentials
-                Extra credentials
-                We are going:
-                    Make a hash of the different types
-                    Split the string on , and loop over each item
-                    Find it in Tower and sort it into its type
-         */
-        HashMap<String, Vector<Long>> credentials = new HashMap<String, Vector<Long>>();
-        credentials.put("vault", new Vector<Long>());
-        credentials.put("machine", new Vector<Long>());
-        credentials.put("extra", new Vector<Long>());
+        HashMap<String, Vector<Long>> credentials = new HashMap<>();
+        credentials.put("vault", new Vector<>());
+        credentials.put("machine", new Vector<>());
+        credentials.put("extra", new Vector<>());
         for(String credentialString : credential.split(","))  {
             try {
-                JSONObject jsonCredential = rawLookupByString(credentialString, "/credentials/");
-                String myCredentialType = null;
+                JSONObject jsonCredential = rawLookupByString(credentialString.trim(), "/credentials/");
+                String myCredentialType;
                 int credentialTypeId = jsonCredential.getInt("credential_type");
                 if (credentialTypeId == machine_credential_type) {
                     myCredentialType = "machine";
@@ -537,70 +460,35 @@ public class TowerConnector implements Serializable {
                     myCredentialType = "extra";
                 }
                 credentials.get(myCredentialType).add(jsonCredential.getLong("id"));
-            } catch(AnsibleTowerItemDoesNotExist ateide) {
-                throw new AnsibleTowerException("Credential "+ credentialString +" does not exist in tower");
             } catch(AnsibleTowerException ate) {
-                throw new AnsibleTowerException("Unable to find credential "+ credentialString +": "+ ate.getMessage());
+                throw new AnsibleTowerException("Unable to find credential "+ credentialString.trim() +": "+ ate.getMessage(), ate);
             }
         }
 
-        /*
-            Now that we have processed everything we have to decide which way to pass it into the API.
-            Pre 3.3 there were three possible parameters:
-                extra_vars, vault_credential, machine_credential
-            Starting in 3.3 you can take the separate parameters or you can pass them all as a single credential param
-
-            Previously the decision point was whether or not we had multiple machine or vault creds.
-            This was because both formats were accepted at one point.
-
-            That behaviour has since been deprecated.
-            We will now check if the version of tower is > 3.5.0 or we have multiple credential types
-         */
-        if(
-                this.towerVersion.is_greater_or_equal("3.5.0") ||
-                (credentials.get("machine").size() > 1 || credentials.get("vault").size() > 1)
-        ) {
-            // We need to pass as a new field
+        if( this.towerVersion != null && this.towerVersion.is_greater_or_equal("3.5.0") || (credentials.get("machine").size() > 1 || credentials.get("vault").size() > 1) ) {
             JSONArray allCredentials = new JSONArray();
             allCredentials.addAll(credentials.get("machine"));
             allCredentials.addAll(credentials.get("vault"));
             allCredentials.addAll(credentials.get("extra"));
             postBody.put("credentials", allCredentials);
         } else {
-            // We need to pass individual fields
-            if(credentials.get("machine").size() > 0) { postBody.put("credential", credentials.get("machine").get(0)); }
-            if(credentials.get("vault").size() > 0) { postBody.put("vault_credential", credentials.get("vault").get(0)); }
-            if(credentials.get("extra").size() > 0) {
+            if(!credentials.get("machine").isEmpty()) { postBody.put("credential", credentials.get("machine").get(0)); }
+            if(!credentials.get("vault").isEmpty()) { postBody.put("vault_credential", credentials.get("vault").get(0)); }
+            if(!credentials.get("extra").isEmpty()) {
                 JSONArray extraCredentials = new JSONArray();
                 extraCredentials.addAll(credentials.get("extra"));
                 postBody.put("extra_credentials", extraCredentials);
             }
         }
-
     }
 
-
-    public long submitTemplate(long jobTemplate, String extraVars, String limit, String jobTags, String skipJobTags, String jobType, String inventory, String credential, String scmBranch, String templateType) throws AnsibleTowerException {
+    public long submitTemplate(long jobTemplateId, String extraVars, String limit, String jobTags, String skipJobTags, String jobType, String inventory, String credential, String scmBranch, String templateType) throws AnsibleTowerException {
         checkTemplateType(templateType);
-
-        String apiEndPoint = "/job_templates/";
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) {
-            apiEndPoint = "/workflow_job_templates/";
-        }
-
+        String apiEndPoint = templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE) ? "/workflow_job_templates/" : "/job_templates/";
         JSONObject postBody = new JSONObject();
-        // I decided not to check if these were integers.
-        // This way, Tower can throw an error if it needs to
-        // And, in the future, if you can reference objects in tower via a tag/name we don't have to undo work here
+
         if(inventory != null && !inventory.isEmpty()) {
-            try {
-                inventory = convertPotentialStringToID(inventory, "/inventories/");
-            } catch(AnsibleTowerItemDoesNotExist atidne) {
-                throw new AnsibleTowerException("Inventory "+ inventory +" does not exist in tower");
-            } catch(AnsibleTowerException ate) {
-                throw new AnsibleTowerException("Unable to find inventory: "+ ate.getMessage());
-            }
-            postBody.put("inventory", inventory);
+            postBody.put("inventory", convertPotentialStringToID(inventory, "/inventories/"));
         }
         if(credential != null && !credential.isEmpty()) {
             processCredentials(credential, postBody);
@@ -623,283 +511,219 @@ public class TowerConnector implements Serializable {
         if(scmBranch != null && !scmBranch.isEmpty()) {
             postBody.put("scm_branch", scmBranch);
         }
-        HttpResponse response = makeRequest(POST, apiEndPoint + jobTemplate + "/launch/", postBody);
 
-        if(response.getStatusLine().getStatusCode() == 201) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch (IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: " + ioe.getMessage());
-            }
-
-            if (responseObject.containsKey("id")) {
-                return responseObject.getLong("id");
-            }
-            logger.logMessage(json);
-            throw new AnsibleTowerException("Did not get an ID from the request. Template response can be found in the jenkins.log");
-        } else if(response.getStatusLine().getStatusCode() == 400) {
-            String json = null;
-            JSONObject responseObject = null;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(Exception e) {
-                logger.logMessage("Unable to parse 400 response from json to get details: "+ e.getMessage());
+        HttpResponse response = makeRequest(POST, apiEndPoint + jobTemplateId + "/launch/", postBody);
+        try {
+            if (response.getStatusLine().getStatusCode() == 201) {
+                String json = EntityUtils.toString(response.getEntity());
+                JSONObject responseObject = JSONObject.fromObject(json);
+                if (responseObject.containsKey("id")) {
+                    return responseObject.getLong("id");
+                }
                 logger.logMessage(json);
-            }
-
-            /*
-                Types of things that might come back:
-                {"extra_vars":["Must be valid JSON or YAML."],"variables_needed_to_start":["'my_var' value missing"]}
-                {"credential":["Invalid pk \"999999\" - object does not exist."]}
-                {"inventory":["Invalid pk \"99999999\" - object does not exist."]}
-
-                Note: we are only testing for extra_vars as the other items should be checked during convertPotentialStringToID
-            */
-
-            if(responseObject != null && responseObject.containsKey("extra_vars")) {
-                throw new AnsibleTowerException("Extra vars are bad: "+ responseObject.getString("extra_vars"));
-            } else {
+                throw new AnsibleTowerException("Did not get an ID from the request.");
+            } else if (response.getStatusLine().getStatusCode() == 400) {
+                String json = EntityUtils.toString(response.getEntity());
+                try {
+                    JSONObject responseObject = JSONObject.fromObject(json);
+                    if(responseObject.containsKey("extra_vars")) {
+                        throw new AnsibleTowerException("Extra vars are bad: "+ responseObject.getJSONArray("extra_vars").join(", "));
+                    }
+                } catch(Exception e) {
+                    // Ignore if parsing fails, throw with full body
+                }
                 throw new AnsibleTowerException("Tower received a bad request (400 response code)\n" + json);
+            } else {
+                throw new AnsibleTowerException("Unexpected error code returned ("+ response.getStatusLine().getStatusCode() +")");
             }
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned ("+ response.getStatusLine().getStatusCode() +")");
+        } catch(IOException e) {
+            throw new AnsibleTowerException("Failed to read response entity: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
     }
 
     public void checkTemplateType(String templateType) throws AnsibleTowerException {
-        if(templateType.equalsIgnoreCase(JOB_TEMPLATE_TYPE)) { return; }
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) { return; }
+        if(templateType.equalsIgnoreCase(JOB_TEMPLATE_TYPE) || templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) {
+            return;
+        }
         throw new AnsibleTowerException("Template type can only be '"+ JOB_TEMPLATE_TYPE +"' or '"+ WORKFLOW_TEMPLATE_TYPE+"'");
     }
 
     public boolean isJobCompleted(long jobID, String templateType) throws AnsibleTowerException {
         checkTemplateType(templateType);
-
-        String apiEndpoint = "/jobs/"+ jobID +"/";
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) { apiEndpoint = "/workflow_jobs/"+ jobID +"/"; }
-        HttpResponse response = makeRequest(GET, apiEndpoint);
-
-        if(response.getStatusLine().getStatusCode() == 200) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
-            }
-
-            if (responseObject.containsKey("finished")) {
-                String finished = responseObject.getString("finished");
-                if(finished == null || finished.equalsIgnoreCase("null")) {
-                    return false;
-                } else {
-                    // Since we were finished we will now also check for stats
-                    if(responseObject.containsKey(ARTIFACTS)) {
-                        logger.logMessage("Processing artifacts");
-                        JSONObject artifacts = responseObject.getJSONObject(ARTIFACTS);
-                        if(artifacts.containsKey("JENKINS_EXPORT")) {
-                            JSONArray exportVariables = artifacts.getJSONArray("JENKINS_EXPORT");
-                            Iterator<JSONObject> listIterator = exportVariables.iterator();
-                            while(listIterator.hasNext()) {
-                                JSONObject entry = listIterator.next();
-                                Iterator<String> keyIterator = entry.keys();
-                                while(keyIterator.hasNext()) {
-                                    String key = keyIterator.next();
-                                    jenkinsExports.put(key, entry.getString(key));
+        String apiEndpoint = templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE) ? "/workflow_jobs/" : "/jobs/";
+        HttpResponse response = makeRequest(GET, apiEndpoint + jobID + "/");
+        try {
+            if (response.getStatusLine().getStatusCode() == 200) {
+                String json = EntityUtils.toString(response.getEntity());
+                JSONObject responseObject = JSONObject.fromObject(json);
+                if (responseObject.containsKey("finished")) {
+                    String finished = responseObject.getString("finished");
+                    if (finished == null || finished.equalsIgnoreCase("null")) {
+                        return false;
+                    } else {
+                        if (responseObject.containsKey(ARTIFACTS)) {
+                            logger.logMessage("Processing artifacts");
+                            JSONObject artifacts = responseObject.getJSONObject(ARTIFACTS);
+                            if (artifacts.containsKey("JENKINS_EXPORT")) {
+                                JSONArray exportVariables = artifacts.getJSONArray("JENKINS_EXPORT");
+                                for (Object o : exportVariables) {
+                                    JSONObject entry = (JSONObject) o;
+                                    for (Object key : entry.keySet()) {
+                                        jenkinsExports.put(key.toString(), entry.getString(key.toString()));
+                                    }
                                 }
                             }
                         }
+                        return true;
                     }
-                    return true;
                 }
+                logger.logMessage(json);
+                throw new AnsibleTowerException("Did not get a finished status from the request.");
+            } else {
+                throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
             }
-            logger.logMessage(json);
-            throw new AnsibleTowerException("Did not get a failed status from the request. Job response can be found in the jenkins.log");
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
+        } catch (IOException e) {
+            throw new AnsibleTowerException("Failed to read response entity: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
     }
 
     public void cancelJob(long jobID, String templateType) throws AnsibleTowerException {
         checkTemplateType(templateType);
+        String apiEndpoint = (templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE) ? "/workflow_jobs/" : "/jobs/") + jobID +"/cancel/";
 
-        String apiEndpoint = "/jobs/"+ jobID +"/";
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) { apiEndpoint = "/workflow_jobs/"+ jobID +"/"; }
-        apiEndpoint = apiEndpoint + "cancel/";
-        HttpResponse response = makeRequest(GET, apiEndpoint);
-
-        if(response.getStatusLine().getStatusCode() != 200) {
-            throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
-        }
-
-        JSONObject responseObject;
-        String json;
+        // Check if job can be canceled
+        HttpResponse getResponse = makeRequest(GET, apiEndpoint);
         try {
-            json = EntityUtils.toString(response.getEntity());
-            responseObject = JSONObject.fromObject(json);
-        } catch(IOException ioe) {
-            throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
+            if (getResponse.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Unexpected error code when checking cancel status (" + getResponse.getStatusLine().getStatusCode() + ")");
+            }
+            JSONObject responseObject = JSONObject.fromObject(EntityUtils.toString(getResponse.getEntity()));
+            if(responseObject.containsKey("can_cancel") && !responseObject.getBoolean("can_cancel")) {
+                throw new AnsibleTowerException("The job cannot be canceled at this time (it may have already finished).");
+            }
+        } catch(IOException e) {
+            throw new AnsibleTowerException("Failed to read cancel check response", e);
+        } finally {
+            EntityUtils.consumeQuietly(getResponse.getEntity());
         }
 
-        if(responseObject.containsKey("can_cancel")) {
-            boolean canCancel = responseObject.getBoolean("can_cancel");
-            // If we can't cancel this job raise an error
-            if(!canCancel) { throw new AnsibleTowerException("The job can not be canceled at this time"); }
+        // Request cancellation
+        HttpResponse postResponse = makeRequest(POST, apiEndpoint);
+        try {
+            if (postResponse.getStatusLine().getStatusCode() != 202) {
+                throw new AnsibleTowerException("Unexpected error code when canceling job (" + postResponse.getStatusLine().getStatusCode() + ")");
+            }
+            logger.logMessage("Cancel request sent successfully.");
+        } finally {
+            EntityUtils.consumeQuietly(postResponse.getEntity());
         }
-
-        // Reuqest for Tower to cancel the job
-        response = makeRequest(POST, apiEndpoint);
-        if(response.getStatusLine().getStatusCode() != 202) {
-            throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode());
-        }
-
-        // We will now try for up to 10 seconds to cancel the job.
-        int counter = 10;
-        while(counter > 0) {
-            response = makeRequest(GET, apiEndpoint);
-            if(response.getStatusLine().getStatusCode() != 200) {
-                throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
-            }
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
-            }
-
-            if (responseObject.containsKey("can_cancel")) {
-                boolean canCancel = responseObject.getBoolean("can_cancel");
-                if(!canCancel) { return; }
-            }
-            counter--;
-            try {
-                Thread.sleep(1000);
-            } catch(InterruptedException ie) {
-                throw new AnsibleTowerException("Interrupted while attempting to cancel job");
-            }
-        }
-
-        throw new AnsibleTowerException("Failed to cancel the job within the specified time limit");
-    }
-
-    /**
-     * @deprecated
-     * Use isJobCompleted
-     */
-    @Deprecated
-    public boolean isJobCommpleted(long jobID, String templateType) throws AnsibleTowerException {
-        return isJobCompleted(jobID, templateType);
     }
 
     public Vector<String> getLogEvents(long jobID, String templateType) throws AnsibleTowerException {
-        Vector<String> events = new Vector<String>();
         checkTemplateType(templateType);
         if(templateType.equalsIgnoreCase(JOB_TEMPLATE_TYPE)) {
-            events.addAll(logJobEvents(jobID));
+            return logJobEvents(jobID);
         } else if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)){
-            events.addAll(logWorkflowEvents(jobID, this.importChildWorkflowLogs));
-        } else {
-            throw new AnsibleTowerException("Tower Connector does not know how to log events for a "+ templateType);
+            return logWorkflowEvents(jobID);
+        }
+        throw new AnsibleTowerException("Tower Connector does not know how to log events for a "+ templateType);
+    }
+
+    private Vector<String> logJobEvents(long jobID) throws AnsibleTowerException {
+        Vector<String> events = new Vector<>();
+        long lastLogId = this.logIdForJobs.getOrDefault(jobID, 0L);
+        boolean keepChecking = true;
+        while(keepChecking) {
+            String apiUrl = "/jobs/" + jobID + "/job_events/?order_by=id&id__gt=" + lastLogId;
+            HttpResponse response = makeRequest(GET, apiUrl);
+            try {
+                if (response.getStatusLine().getStatusCode() != 200) {
+                    throw new AnsibleTowerException("Unexpected error retrieving job events (" + response.getStatusLine().getStatusCode() + ")");
+                }
+                String json = EntityUtils.toString(response.getEntity());
+                JSONObject responseObject = JSONObject.fromObject(json);
+
+                if(responseObject.containsKey("next") && (responseObject.getString("next") == null || responseObject.getString("next").equalsIgnoreCase("null"))) {
+                    keepChecking = false;
+                }
+
+                if (responseObject.containsKey("results")) {
+                    for (Object anEvent : responseObject.getJSONArray("results")) {
+                        JSONObject eventObject = (JSONObject) anEvent;
+                        long eventId = eventObject.getLong("id");
+                        String stdOut = eventObject.getString("stdout");
+                        events.addAll(logLine(stdOut));
+                        lastLogId = Math.max(lastLogId, eventId);
+                    }
+                }
+                this.logIdForJobs.put(jobID, lastLogId);
+            } catch (IOException e) {
+                throw new AnsibleTowerException("Failed to read job events response: " + e.getMessage(), e);
+            } finally {
+                EntityUtils.consumeQuietly(response.getEntity());
+            }
         }
         return events;
     }
 
-    private static String UNIFIED_JOB_TYPE = "unified_job_type";
-    private static String UNIFIED_JOB_TEMPLATE = "unified_job_template";
+    private Vector<String> logWorkflowEvents(long jobID) throws AnsibleTowerException {
+        logger.logMessage("Note: Workflow log retrieval is a simplified implementation.");
+        Vector<String> events = new Vector<>();
+        long lastNodeId = this.logIdForWorkflows.getOrDefault(jobID, 0L);
 
-    private Vector<String> logWorkflowEvents(long jobID, boolean importWorkflowChildLogs) throws AnsibleTowerException {
-        Vector<String> events = new Vector<String>();
-        if(!this.logIdForWorkflows.containsKey(jobID)) { this.logIdForWorkflows.put(jobID, 0L); }
-        HttpResponse response = makeRequest(GET, "/workflow_jobs/"+ jobID +"/workflow_nodes/?id__gt="+this.logIdForWorkflows.get(jobID));
-
-        if(response.getStatusLine().getStatusCode() == 200) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
+        String apiUrl = "/workflow_jobs/" + jobID + "/workflow_nodes/?order_by=id&id__gt=" + lastNodeId;
+        HttpResponse response = makeRequest(GET, apiUrl);
+        try {
+            if (response.getStatusLine().getStatusCode() != 200) {
+                throw new AnsibleTowerException("Unexpected error retrieving workflow nodes (" + response.getStatusLine().getStatusCode() + ")");
             }
+            String json = EntityUtils.toString(response.getEntity());
+            JSONObject responseObject = JSONObject.fromObject(json);
+            if (responseObject.containsKey("results")) {
+                for (Object anEvent : responseObject.getJSONArray("results")) {
+                    JSONObject anEventObject = (JSONObject) anEvent;
+                    long nodeId = anEventObject.getLong("id");
+                    if (anEventObject.containsKey("summary_fields") && anEventObject.getJSONObject("summary_fields").containsKey("job")) {
+                        JSONObject job = anEventObject.getJSONObject("summary_fields").getJSONObject("job");
+                        String name = job.getString("name");
+                        String status = job.getString("status");
+                        long childJobId = job.getLong("id");
+                        events.addAll(logLine(name + " => " + status + " " + this.getJobURL(childJobId, JOB_TEMPLATE_TYPE)));
 
-            logger.logMessage(json);
-
-            if(responseObject.containsKey("results")) {
-                for(Object anEventObject : responseObject.getJSONArray("results")) {
-                    JSONObject anEvent = (JSONObject) anEventObject;
-                    long eventId = anEvent.getLong("id");
-
-                    if(!anEvent.containsKey("summary_fields")) { continue; }
-
-                    JSONObject summaryFields = anEvent.getJSONObject("summary_fields");
-                    if(!summaryFields.containsKey("job")) { continue; }
-                    if(!summaryFields.containsKey(UNIFIED_JOB_TEMPLATE)) { continue; }
-
-                    JSONObject templateType = summaryFields.getJSONObject(UNIFIED_JOB_TEMPLATE);
-                    if(!templateType.containsKey(UNIFIED_JOB_TYPE)) { continue; }
-
-                    JSONObject job = summaryFields.getJSONObject("job");
-                    if(
-                            !job.containsKey("status") ||
-                            job.getString("status").equalsIgnoreCase("running") ||
-                            job.getString("status").equalsIgnoreCase("pending")
-                    ) {
-                        // Here we want to return. Otherwise we might "loose" things.
-                        // For async_pipeline, say there are three nodes in the pipeline.
-                        // Node 1 takes a long time, Node 2 which runs in parallel is quick
-                        // If Node 2 executes second and completed we will use the ID of node 2 as the next ID.
-                        // Node 1 results will be lost because node 2 has already finished.
-                        // Returning will prevent this from happening.
-                        return events;
-                    }
-
-                    if(eventId > this.logIdForWorkflows.get(jobID)) { this.logIdForWorkflows.put(jobID, eventId); }
-                    events.addAll(logLine(job.getString("name") +" => "+ job.getString("status") +" "+ this.getJobURL(job.getLong("id"), JOB_TEMPLATE_TYPE)));
-
-                    if(importWorkflowChildLogs) {
-                        if(templateType.getString(UNIFIED_JOB_TYPE).equalsIgnoreCase("job")) {
-                            // We only need to call this once because the job is completed at this point
-                            events.addAll(logJobEvents(job.getLong("id")));
-                        } else if(templateType.getString(UNIFIED_JOB_TYPE).equalsIgnoreCase("project_update")) {
-                            events.addAll(logProjectSync(job.getLong("id")));
-                        } else if(templateType.getString(UNIFIED_JOB_TYPE).equalsIgnoreCase("inventory_update")) {
-                            events.addAll(logInventorySync(job.getLong("id")));
-                        } else {
-                            events.addAll(logLine("Unknown job type in workflow: "+ templateType.getString(UNIFIED_JOB_TYPE)));
+                        if(importChildWorkflowLogs) {
+                            events.addAll(logJobEvents(childJobId));
+                            events.add(""); // Add spacer
                         }
                     }
-                    // Print two spaces to put some space between this and the next task.
-                    events.addAll(logLine(""));
-                    events.addAll(logLine(""));
+                    lastNodeId = Math.max(lastNodeId, nodeId);
                 }
             }
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned ("+ response.getStatusLine().getStatusCode() +")");
+            this.logIdForWorkflows.put(jobID, lastNodeId);
+        } catch(IOException e) {
+            throw new AnsibleTowerException("Failed to read workflow nodes response: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
         return events;
     }
 
-    public Vector<String> logLine(String output) throws AnsibleTowerException {
-        Vector<String> return_lines = new Vector<String>();
-        String[] lines = output.split("\\r\\n");
+    public Vector<String> logLine(String output) {
+        Vector<String> return_lines = new Vector<>();
+        String[] lines = output.split("\\r?\\n");
         for(String line : lines) {
-            // Even if we don't log, we are going to see if this line contains the string JENKINS_EXPORT VAR=value
-            if(line.matches("^.*JENKINS_EXPORT.*$")) {
-                // The value might have some ansi color on it so we need to force the removal  of it
+            if(line.contains("JENKINS_EXPORT")) {
                 String[] entities = removeColor(line).split("=", 2);
                 if(entities.length == 2) {
-                    entities[0] = entities[0].replaceAll(".*JENKINS_EXPORT ", "");
-                    entities[1] = entities[1].replaceAll("\"$", "");
-                    jenkinsExports.put(entities[0], entities[1]);
+                    String key = entities[0].replaceAll(".*JENKINS_EXPORT", "").trim();
+                    String value = entities[1].replaceAll("^\"|\"$", "").trim();
+                    jenkinsExports.put(key, value);
                 }
             }
             if(removeColor) {
-                // This regex was found on https://stackoverflow.com/questions/14652538/remove-ascii-color-codes
                 line = removeColor(line);
             }
             return_lines.add(line);
@@ -911,150 +735,38 @@ public class TowerConnector implements Serializable {
         return coloredLine.replaceAll("\u001B\\[[;\\d]*m", "");
     }
 
-
-    private Vector<String> logInventorySync(long syncID) throws AnsibleTowerException {
-        Vector<String> events = new Vector<String>();
-        // These are not normal logs, so we don't need to paginate
-        String apiURL = "/inventory_updates/"+ syncID +"/";
-        HttpResponse response = makeRequest(GET, apiURL);
-        if(response.getStatusLine().getStatusCode() == 200) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
-            }
-
-            logger.logMessage(json);
-
-            if(responseObject.containsKey("result_stdout")) {
-                events.addAll(logLine(responseObject.getString("result_stdout")));
-            }
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned ("+ response.getStatusLine().getStatusCode() +")");
-        }
-        return events;
-    }
-
-
-    private Vector<String> logProjectSync(long syncID) throws AnsibleTowerException {
-        Vector<String> events = new Vector<String>();
-        // These are not normal logs, so we don't need to paginate
-        String apiURL = "/project_updates/"+ syncID +"/";
-        HttpResponse response = makeRequest(GET, apiURL);
-        if(response.getStatusLine().getStatusCode() == 200) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
-            }
-
-            logger.logMessage(json);
-
-            if(responseObject.containsKey("result_stdout")) {
-                events.addAll(logLine(responseObject.getString("result_stdout")));
-            }
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned ("+ response.getStatusLine().getStatusCode() +")");
-        }
-        return events;
-    }
-
-    private Vector<String> logJobEvents(long jobID) throws AnsibleTowerException {
-        Vector<String> events = new Vector<String>();
-        if(!this.logIdForJobs.containsKey(jobID)) { this.logIdForJobs.put(jobID, 0L); }
-        boolean keepChecking = true;
-        while(keepChecking) {
-            String apiURL = "/jobs/" + jobID + "/job_events/?id__gt="+ this.logIdForJobs.get(jobID);
-            HttpResponse response = makeRequest(GET, apiURL);
-
+    public boolean isJobFailed(long jobID, String templateType) throws AnsibleTowerException {
+        checkTemplateType(templateType);
+        String apiEndPoint = templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE) ? "/workflow_jobs/" : "/jobs/";
+        HttpResponse response = makeRequest(GET, apiEndPoint + jobID + "/");
+        try {
             if (response.getStatusLine().getStatusCode() == 200) {
-                JSONObject responseObject;
-                String json;
-                try {
-                    json = EntityUtils.toString(response.getEntity());
-                    responseObject = JSONObject.fromObject(json);
-                } catch (IOException ioe) {
-                    throw new AnsibleTowerException("Unable to read response and convert it into json: " + ioe.getMessage());
+                String json = EntityUtils.toString(response.getEntity());
+                JSONObject responseObject = JSONObject.fromObject(json);
+                if (responseObject.containsKey("failed")) {
+                    return responseObject.getBoolean("failed");
                 }
-
                 logger.logMessage(json);
-
-                if(responseObject.containsKey("next") && responseObject.getString("next") == null || responseObject.getString("next").equalsIgnoreCase("null")) {
-                    keepChecking = false;
-                }
-                if (responseObject.containsKey("results")) {
-                    for (Object anEvent : responseObject.getJSONArray("results")) {
-                        JSONObject eventObject = (JSONObject) anEvent;
-                        long eventId = eventObject.getLong("id");
-                        String stdOut = eventObject.getString("stdout");
-                        if(this.getFullLogs) {
-                            try {
-                                stdOut = eventObject.getJSONObject("event_data").getJSONObject("res").getString("msg");
-                            } catch (Exception e) {
-                                // If we don't have this its ok, not all messages will have the res
-                            }
-                        }
-                        events.addAll(logLine(stdOut));
-                        if (eventId > this.logIdForJobs.get(jobID)) {
-                            this.logIdForJobs.put(jobID, eventId);
-                        }
-                    }
-                }
+                throw new AnsibleTowerException("Did not get a failed status from the request.");
             } else {
                 throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
             }
-        }
-        return events;
-    }
-
-    public boolean isJobFailed(long jobID, String templateType) throws AnsibleTowerException {
-        checkTemplateType(templateType);
-
-        String apiEndPoint = "/jobs/"+ jobID +"/";
-        if(templateType.equalsIgnoreCase(WORKFLOW_TEMPLATE_TYPE)) { apiEndPoint = "/workflow_jobs/"+ jobID +"/"; }
-        HttpResponse response = makeRequest(GET, apiEndPoint);
-
-        if(response.getStatusLine().getStatusCode() == 200) {
-            JSONObject responseObject;
-            String json;
-            try {
-                json = EntityUtils.toString(response.getEntity());
-                responseObject = JSONObject.fromObject(json);
-            } catch(IOException ioe) {
-                throw new AnsibleTowerException("Unable to read response and convert it into json: "+ ioe.getMessage());
-            }
-
-            if (responseObject.containsKey("failed")) {
-                return responseObject.getBoolean("failed");
-            }
-            logger.logMessage(json);
-            throw new AnsibleTowerException("Did not get a failed status from the request. Job response can be found in the jenkins.log");
-        } else {
-            throw new AnsibleTowerException("Unexpected error code returned (" + response.getStatusLine().getStatusCode() + ")");
+        } catch (IOException e) {
+            throw new AnsibleTowerException("Failed to read response entity: " + e.getMessage(), e);
+        } finally {
+            EntityUtils.consumeQuietly(response.getEntity());
         }
     }
 
     public String getJobURL(long myJobID, String templateType) {
-        String returnURL = url +"/#/";
-        if (templateType.equalsIgnoreCase(TowerConnector.JOB_TEMPLATE_TYPE)) {
-            returnURL += "jobs";
-        } else {
-            returnURL += "workflows";
-        }
-        returnURL += "/"+ myJobID;
-        return returnURL;
+        String path = templateType.equalsIgnoreCase(JOB_TEMPLATE_TYPE) ? "jobs/playbook/" : "workflows/";
+        return url +"/#/"+ path + myJobID;
     }
 
     private String getBasicAuthString() {
         String auth = this.username + ":" + this.password;
-        byte[] encodedAuth = Base64.encodeBase64(auth.getBytes(Charset.forName("UTF-8")));
-        return "Basic " + new String(encodedAuth, Charset.forName("UTF-8"));
+        byte[] encodedAuth = Base64.encodeBase64(auth.getBytes(StandardCharsets.UTF_8));
+        return "Basic " + new String(encodedAuth, StandardCharsets.UTF_8);
     }
 
     private String getOAuthToken() throws AnsibleTowerException {
@@ -1063,60 +775,51 @@ public class TowerConnector implements Serializable {
         oauthTokenRequest.setHeader(HttpHeaders.AUTHORIZATION, this.getBasicAuthString());
         JSONObject body = new JSONObject();
         body.put("description", "Jenkins Token");
-        body.put("application", null);
+        body.put("application", (Object) null);
         body.put("scope", "write");
         try {
-            StringEntity bodyEntity = new StringEntity(body.toString());
-            oauthTokenRequest.setEntity(bodyEntity);
-        } catch(UnsupportedEncodingException uee) {
-            throw new AnsibleTowerException("Unable to encode body as JSON: "+ uee.getMessage());
+            oauthTokenRequest.setEntity(new StringEntity(body.toString(), StandardCharsets.UTF_8));
+        } catch(Exception uee) {
+            throw new AnsibleTowerException("Unable to encode body as JSON: "+ uee.getMessage(), uee);
         }
-
         oauthTokenRequest.setHeader("Content-Type", "application/json");
 
-        DefaultHttpClient httpClient = getHttpClient();
-        HttpResponse response;
+        HttpResponse response = null;
         try {
             logger.logMessage("Calling for oauth token at "+ tokenURI);
-            response = httpClient.execute(oauthTokenRequest);
+            response = getHttpClient().execute(oauthTokenRequest);
+            int statusCode = response.getStatusLine().getStatusCode();
+            if(statusCode == 400 || statusCode == 401) {
+                throw new AnsibleTowerException("Username/password invalid");
+            } else if(statusCode == 404) {
+                throw new AnsibleTowerDoesNotSupportAuthToken("Server does not have tokens endpoint: " + tokenURI);
+            } else if(statusCode == 403) {
+                throw new AnsibleTowerRefusesToGiveToken("Server refuses to give tokens");
+            } else if(statusCode != 200 && statusCode != 201) {
+                throw new AnsibleTowerException("Unable to get oauth token, server responded with ("+ statusCode +")");
+            }
+            String json = EntityUtils.toString(response.getEntity());
+            JSONObject responseObject = JSONObject.fromObject(json);
+            if (responseObject.containsKey("id")) {
+                this.oAuthTokenID = responseObject.getString("id");
+            }
+            if (responseObject.containsKey("token")) {
+                logger.logMessage("AuthToken acquired ("+ this.oAuthTokenID +")");
+                return responseObject.getString("token");
+            }
+            logger.logMessage(json);
+            throw new AnsibleTowerException("Did not get an oauth token from the request.");
         } catch(Exception e) {
-            throw new AnsibleTowerException("Unable to make request for an oauth token: "+ e.getMessage());
+            throw new AnsibleTowerException("Unable to make request for an oauth token: "+ e.getMessage(), e);
+        } finally {
+            if(response != null) {
+                EntityUtils.consumeQuietly(response.getEntity());
+            }
         }
-
-        if(response.getStatusLine().getStatusCode() == 400 || response.getStatusLine().getStatusCode() == 401) {
-            throw new AnsibleTowerException("Username/password invalid");
-        } else if(response.getStatusLine().getStatusCode() == 404) {
-            throw new AnsibleTowerDoesNotSupportAuthToken("Server does not have tokens endpoint: " + tokenURI);
-        } else if(response.getStatusLine().getStatusCode() == 403) {
-            throw new AnsibleTowerRefusesToGiveToken("Server refuses to give tokens");
-        } else if(response.getStatusLine().getStatusCode() != 200 && response.getStatusLine().getStatusCode() != 201) {
-            throw new AnsibleTowerException("Unable to get oauth token, server responded with ("+ response.getStatusLine().getStatusCode() +")");
-        }
-
-        JSONObject responseObject;
-        String json;
-        try {
-            json = EntityUtils.toString(response.getEntity());
-            responseObject = JSONObject.fromObject(json);
-        } catch (IOException ioe) {
-            throw new AnsibleTowerException("Unable to read oatuh response and convert it into json: " + ioe.getMessage());
-        }
-
-        if (responseObject.containsKey("id")) {
-            this.oAuthTokenID = responseObject.getString("id");
-        }
-
-        if (responseObject.containsKey("token")) {
-            logger.logMessage("AuthToken acquired ("+ this.oAuthTokenID +")");
-            return responseObject.getString("token");
-        }
-        logger.logMessage(json);
-        throw new AnsibleTowerException("Did not get an oauth token from the request. Template response can be found in the jenkins.log");
     }
 
     private String getAuthToken() throws AnsibleTowerException {
         logger.logMessage("Getting auth token for "+ this.username);
-
         String tokenURI = url + this.buildEndpoint("/authtoken/");
         HttpPost tokenRequest = new HttpPost(tokenURI);
         tokenRequest.setHeader(HttpHeaders.AUTHORIZATION, this.getBasicAuthString());
@@ -1124,46 +827,38 @@ public class TowerConnector implements Serializable {
         body.put("username", this.username);
         body.put("password", this.password);
         try {
-            StringEntity bodyEntity = new StringEntity(body.toString());
-            tokenRequest.setEntity(bodyEntity);
-        } catch(UnsupportedEncodingException uee) {
-            throw new AnsibleTowerException("Unable to encode body as JSON: "+ uee.getMessage());
+            tokenRequest.setEntity(new StringEntity(body.toString(), StandardCharsets.UTF_8));
+        } catch(Exception uee) {
+            throw new AnsibleTowerException("Unable to encode body as JSON: "+ uee.getMessage(), uee);
         }
-
         tokenRequest.setHeader("Content-Type", "application/json");
-
-        DefaultHttpClient httpClient = getHttpClient();
-        HttpResponse response;
+        HttpResponse response = null;
         try {
             logger.logMessage("Calling for token at "+ tokenURI);
-            response = httpClient.execute(tokenRequest);
+            response = getHttpClient().execute(tokenRequest);
+            int statusCode = response.getStatusLine().getStatusCode();
+            if(statusCode == 400) {
+                throw new AnsibleTowerException("Username/password invalid");
+            } else if(statusCode == 404) {
+                throw new AnsibleTowerDoesNotSupportAuthToken("Server does not have endpoint: " + tokenURI);
+            } else if(statusCode != 200 && statusCode != 201) {
+                throw new AnsibleTowerException("Unable to get auth token, server responded with ("+ statusCode +")");
+            }
+            String json = EntityUtils.toString(response.getEntity());
+            JSONObject responseObject = JSONObject.fromObject(json);
+            if (responseObject.containsKey("token")) {
+                logger.logMessage("AuthToken acquired");
+                return responseObject.getString("token");
+            }
+            logger.logMessage(json);
+            throw new AnsibleTowerException("Did not get a token from the request.");
         } catch(Exception e) {
-            throw new AnsibleTowerException("Unable to make request for an authtoken: "+ e.getMessage());
+            throw new AnsibleTowerException("Unable to make request for an authtoken: "+ e.getMessage(), e);
+        } finally {
+            if(response != null) {
+                EntityUtils.consumeQuietly(response.getEntity());
+            }
         }
-
-        if(response.getStatusLine().getStatusCode() == 400) {
-            throw new AnsibleTowerException("Username/password invalid");
-        } else if(response.getStatusLine().getStatusCode() == 404) {
-            throw new AnsibleTowerDoesNotSupportAuthToken("Server does not have endpoint: " + tokenURI);
-        } else if(response.getStatusLine().getStatusCode() != 200 && response.getStatusLine().getStatusCode() != 201) {
-            throw new AnsibleTowerException("Unable to get auth token, server responded with ("+ response.getStatusLine().getStatusCode() +")");
-        }
-
-        JSONObject responseObject;
-        String json;
-        try {
-            json = EntityUtils.toString(response.getEntity());
-            responseObject = JSONObject.fromObject(json);
-        } catch (IOException ioe) {
-            throw new AnsibleTowerException("Unable to read response and convert it into json: " + ioe.getMessage());
-        }
-
-        if (responseObject.containsKey("token")) {
-            logger.logMessage("AuthToken acquired");
-            return responseObject.getString("token");
-        }
-        logger.logMessage(json);
-        throw new AnsibleTowerException("Did not get a token from the request. Template response can be found in the jenkins.log");
     }
 
     public void releaseToken() {
@@ -1174,29 +869,42 @@ public class TowerConnector implements Serializable {
                 HttpDelete tokenRequest = new HttpDelete(tokenURI);
                 tokenRequest.setHeader(HttpHeaders.AUTHORIZATION, this.getBasicAuthString());
 
-                DefaultHttpClient httpClient = getHttpClient();
-                logger.logMessage("Calling for oAuth token delete at " + tokenURI);
-                HttpResponse response = httpClient.execute(tokenRequest);
+                HttpResponse response = getHttpClient().execute(tokenRequest);
+                EntityUtils.consumeQuietly(response.getEntity());
+
                 if(response.getStatusLine().getStatusCode() == 400) {
                     logger.logMessage("Unable to delete oAuthToken: Invalid Authorization");
                 } else if(response.getStatusLine().getStatusCode() != 204) {
                     logger.logMessage("Unable to delete oauth token, server responded with ("+ response.getStatusLine().getStatusCode() +")");
+                } else {
+                    logger.logMessage("oAuth Token deleted");
                 }
-                logger.logMessage("oAuth Token deleted");
-
-                this.oAuthTokenID = null;
-                this.authorizationHeader = null;
             } catch(Exception e) {
                 logger.logMessage("Failed to delete token: "+ e.getMessage());
+            } finally {
+                this.oAuthTokenID = null;
+                this.authorizationHeader = null;
             }
+        }
 
+        if (this.httpClient != null) {
+            try {
+                this.httpClient.close();
+            } catch (IOException e) {
+                logger.logMessage("Error closing HttpClient: " + e.getMessage());
+            }
+        }
+        if (this.connectionManager != null) {
+            this.connectionManager.close();
         }
     }
 
     public String getMethodName(int methodId) {
-        if(methodId == 1) { return "GET"; }
-        else if(methodId == 2) { return "POST"; }
-        else if(methodId == 3) { return "PATCH"; }
-        else { return "UNKNOWN"; }
+        switch (methodId) {
+            case 1: return "GET";
+            case 2: return "POST";
+            case 3: return "PATCH";
+            default: return "UNKNOWN";
+        }
     }
 }
