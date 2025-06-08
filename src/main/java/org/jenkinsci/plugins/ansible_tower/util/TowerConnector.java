@@ -72,10 +72,17 @@ public class TowerConnector implements Serializable {
     private transient CloseableHttpClient httpClient;
     private transient PoolingHttpClientConnectionManager connectionManager;
 
+    private final int connectTimeout;
+    private final int socketTimeout;
+    private final int connectionRequestTimeout;
 
-    public TowerConnector(String url, String username, String password) { this(url, username, password, null, false, false); }
+    private static final int DEFAULT_CONNECT_TIMEOUT_SECONDS = 10;
+    private static final int DEFAULT_SOCKET_TIMEOUT_SECONDS = 30;
+    private static final int DEFAULT_CONNECTION_REQUEST_TIMEOUT_SECONDS = 10;
 
-    public TowerConnector(String url, String username, String password, String oauthToken, Boolean trustAllCerts, Boolean debug) {
+    public TowerConnector(String url, String username, String password) { this(url, username, password, null, false, false, null, null, null); }
+
+    public TowerConnector(String url, String username, String password, String oauthToken, Boolean trustAllCerts, Boolean debug, String connectTimeoutStr, String socketTimeoutStr, String requestTimeoutStr) {
         if(url != null && !url.isEmpty() && url.charAt(url.length() - 1) == '/') {
             this.url = url.substring(0, (url.length() - 1));
         } else {
@@ -85,6 +92,12 @@ public class TowerConnector implements Serializable {
         this.password = password;
         this.oauthToken = oauthToken;
         this.trustAllCerts = trustAllCerts;
+
+        // Parse timeouts
+        this.connectTimeout = parseTimeout(connectTimeoutStr, DEFAULT_CONNECT_TIMEOUT_SECONDS);
+        this.socketTimeout = parseTimeout(socketTimeoutStr, DEFAULT_SOCKET_TIMEOUT_SECONDS);
+        this.connectionRequestTimeout = parseTimeout(requestTimeoutStr, DEFAULT_CONNECTION_REQUEST_TIMEOUT_SECONDS);
+
         this.setDebug(debug);
         try {
             this.getVersion();
@@ -95,6 +108,20 @@ public class TowerConnector implements Serializable {
             logger.logMessage("Failed to get Tower version; auth errors may ensue: "+ ate.getMessage());
         }
         logger.logMessage("Created a connector with "+ username +"@"+ this.url);
+    }
+
+    private int parseTimeout(String timeoutStr, int defaultValue) {
+        if (timeoutStr != null && !timeoutStr.trim().isEmpty()) {
+            try {
+                int timeout = Integer.parseInt(timeoutStr.trim());
+                if (timeout > 0) {
+                    return timeout;
+                }
+            } catch (NumberFormatException e) {
+                logger.logMessage("Invalid timeout value '" + timeoutStr + "', using default of " + defaultValue + "s.");
+            }
+        }
+        return defaultValue;
     }
 
     public void setDebug(boolean debug) {
@@ -109,9 +136,9 @@ public class TowerConnector implements Serializable {
         if (this.httpClient == null) {
             try {
                 RequestConfig requestConfig = RequestConfig.custom()
-                        .setConnectTimeout(10 * 1000)
-                        .setSocketTimeout(30 * 1000)
-                        .setConnectionRequestTimeout(10 * 1000)
+                        .setConnectTimeout(this.connectTimeout * 1000)
+                        .setSocketTimeout(this.socketTimeout * 1000)
+                        .setConnectionRequestTimeout(this.connectionRequestTimeout * 1000)
                         .build();
 
                 HttpClientBuilder clientBuilder = HttpClientBuilder.create()

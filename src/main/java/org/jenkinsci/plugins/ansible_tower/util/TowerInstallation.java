@@ -40,15 +40,21 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
     private String towerCredentialsId;
     private final boolean towerTrustCert;
     private final boolean enableDebugging;
+    private final String connectTimeout;
+    private final String socketTimeout;
+    private final String connectionRequestTimeout;
     private Run run;
 
     @DataBoundConstructor
-    public TowerInstallation(String towerDisplayName, String towerURL, String towerCredentialsId, boolean towerTrustCert, boolean enableDebugging) {
+    public TowerInstallation(String towerDisplayName, String towerURL, String towerCredentialsId, boolean towerTrustCert, boolean enableDebugging, String connectTimeout, String socketTimeout, String connectionRequestTimeout) {
         this.towerDisplayName = towerDisplayName;
         this.towerCredentialsId = towerCredentialsId;
         this.towerURL = towerURL;
         this.towerTrustCert = towerTrustCert;
         this.enableDebugging = enableDebugging;
+        this.connectTimeout = connectTimeout;
+        this.socketTimeout = socketTimeout;
+        this.connectionRequestTimeout = connectionRequestTimeout;
     }
 
     public String getTowerDisplayName() {
@@ -71,6 +77,12 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
         return this.enableDebugging;
     }
 
+    public String getConnectTimeout() { return connectTimeout; }
+
+    public String getSocketTimeout() { return socketTimeout; }
+
+    public String getConnectionRequestTimeout() { return connectionRequestTimeout; }
+
     public void setTowerCredentialsId(String towerCredentialsId) {
         this.towerCredentialsId = towerCredentialsId;
     }
@@ -81,11 +93,12 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
 
     public TowerConnector getTowerConnector() {
         return TowerInstallation.getTowerConnectorStatic(this.towerURL, this.towerCredentialsId, this.towerTrustCert,
-                this.enableDebugging, this.run);
+                this.enableDebugging, this.run, this.connectTimeout, this.socketTimeout, this.connectionRequestTimeout);
     }
 
     public static TowerConnector getTowerConnectorStatic(String towerURL, String towerCredentialsId, boolean trustCert,
-                                                         boolean enableDebugging, Run run) {
+                                                         boolean enableDebugging, Run run,
+                                                         String connectTimeout, String socketTimeout, String connectionRequestTimeout) {
         String username = null;
         String password = null;
         String oauth_token = null;
@@ -104,7 +117,7 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
                 }
             }
         }
-        TowerConnector testConnector = new TowerConnector(towerURL, username, password, oauth_token, trustCert, enableDebugging);
+        TowerConnector testConnector = new TowerConnector(towerURL, username, password, oauth_token, trustCert, enableDebugging, connectTimeout, socketTimeout, connectionRequestTimeout);
         return testConnector;
     }
     
@@ -125,18 +138,47 @@ public class TowerInstallation extends AbstractDescribableImpl<TowerInstallation
     @Extension
     public static class TowerInstallationDescriptor extends Descriptor<TowerInstallation> {
 
+        private FormValidation doCheckTimeoutField(String value, String fieldName) {
+            if (StringUtils.isBlank(value)) {
+                return FormValidation.ok("Default will be used.");
+            }
+            try {
+                if (Integer.parseInt(value) > 0) {
+                    return FormValidation.ok();
+                }
+            } catch (NumberFormatException e) {
+                // fall through to error
+            }
+            return FormValidation.error(fieldName + " must be a positive integer.");
+        }
+
+        public FormValidation doCheckConnectTimeout(@QueryParameter String value) {
+            return doCheckTimeoutField(value, "Connect Timeout");
+        }
+
+        public FormValidation doCheckSocketTimeout(@QueryParameter String value) {
+            return doCheckTimeoutField(value, "Socket Timeout");
+        }
+
+        public FormValidation doCheckConnectionRequestTimeout(@QueryParameter String value) {
+            return doCheckTimeoutField(value, "Connection Request Timeout");
+        }
+
         // This requires a POST method to protect from CSFR
         @POST
         public FormValidation doTestTowerConnection(
                 @QueryParameter("towerURL") final String towerURL,
                 @QueryParameter("towerCredentialsId") final String towerCredentialsId,
                 @QueryParameter("towerTrustCert") final boolean towerTrustCert,
-                @QueryParameter("enableDebugging") final boolean enableDebugging
+                @QueryParameter("enableDebugging") final boolean enableDebugging,
+                @QueryParameter("connectTimeout") final String connectTimeout,
+                @QueryParameter("socketTimeout") final String socketTimeout,
+                @QueryParameter("connectionRequestTimeout") final String connectionRequestTimeout
         ) {
             // Also, validate that we are an Administrator
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
             TowerLogger.writeMessage("Starting to test connection with (" + towerURL + ") and (" + towerCredentialsId + ") and (" + towerTrustCert + ") with debugging (" + enableDebugging + ")");
-            TowerConnector testConnector = TowerInstallation.getTowerConnectorStatic(towerURL, towerCredentialsId, towerTrustCert, enableDebugging, null);
+            TowerConnector testConnector = TowerInstallation.getTowerConnectorStatic(towerURL, towerCredentialsId, towerTrustCert, enableDebugging, null, connectTimeout, socketTimeout, connectionRequestTimeout);
             try {
                 testConnector.testConnection();
                 return FormValidation.ok("Success");

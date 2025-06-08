@@ -19,6 +19,18 @@
                     <f:entry title="${%Enable Debugging}" field="enableDebugging" help="/plugin/ansible-tower/help-enableDebugging.html">
                         <f:checkbox/>
                     </f:entry>
+                    <f:entry title="Connect Timeout" field="connectTimeout"
+                             description="Timeout in seconds for establishing a connection with the Tower server. Default is 10.">
+                        <f:textbox />
+                    </f:entry>
+                    <f:entry title="Socket Timeout" field="socketTimeout"
+                             description="Timeout in seconds for waiting for data after a connection is established. Default is 30.">
+                        <f:textbox />
+                    </f:entry>
+                    <f:entry title="Connection Request Timeout" field="connectionRequestTimeout"
+                             description="Timeout in seconds for requesting a connection from the connection pool. Default is 10.">
+                        <f:textbox />
+                    </f:entry>
 
                     <f:validateButton
                             title="${%Test Connection}" progress="${%Testing...}"
